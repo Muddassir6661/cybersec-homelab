@@ -1,5 +1,7 @@
 # Home SOC Lab: Building a Detection Pipeline with Wazuh and DVWA
 
+<img width="1919" height="970" alt="Screenshot 2026-09-07 111845" src="https://github.com/user-attachments/assets/7cd70b13-185f-4fcd-8442-a735cc7520d9" />
+
 ## Overview
 
 This project involved building a small-scale Security Operations Center (SOC) lab on repurposed hardware to practice both offensive and defensive security skills. The goal was to deploy an intentionally vulnerable web application, monitor it with a SIEM, and write custom detection rules to catch real attacks as they happen — end to end, from exploitation to alert.
