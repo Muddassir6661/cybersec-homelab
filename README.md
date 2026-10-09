@@ -114,6 +114,20 @@ Getting these rules working was not a straight line, and the debugging process i
 - **Hydra against DVWA's web login failed entirely:** DVWA issues a fresh session cookie and CSRF token (`user_token`) on every page load, and the login form silently rejects submissions without a valid, current token. This made Hydra's stateless attack pattern unreliable against the web form. **Pivoted to SSH brute-forcing instead** — a more standard and reliable real-world brute-force target, and arguably a stronger demonstration since it required creating a dedicated test account and tuning a genuinely new correlation rule.
 - **Docker volume mount overwrote container files:** Attempting to mount an empty host directory directly onto DVWA's `/var/www/html` inside the running container replaced (not merged with) the container's existing files, breaking DVWA. Resolved by instead using `docker cp` to take a one-time copy of the web root onto the host for FIM monitoring, avoiding any risk to the live container.
 
+## Kill Chain & MITRE ATT&CK Mapping
+
+Each detection rule was mapped against the Lockheed Martin Cyber Kill Chain and MITRE ATT&CK to tie the lab's alerts back to standard industry frameworks:
+
+| Rule | Incident | Kill Chain Stage | MITRE ATT&CK ID |
+|---|---|---|---|
+| 100010 | SQL Injection (encoded quote) | Exploitation | T1190 – Exploit Public-Facing Application |
+| 100011 | SQL Injection (keywords) | Exploitation | T1190 – Exploit Public-Facing Application |
+| 100012 | XSS (script tag) | Exploitation | T1190 – Exploit Public-Facing Application |
+| 100013 | SSH Brute-Force | Exploitation (credential access attempt) | T1110.001 – Brute Force: Password Guessing |
+| 550 (FIM) | Unauthorized file modification | Installation (persistence/backdoor being planted) | T1505.003 – Server Software Component: Web Shell |
+
+Note the distinction between the two later stages: SQLi, XSS, and brute-force attempts all represent an attacker trying to gain an initial foothold (**Exploitation**), while the FIM alert represents a different stage entirely — an attacker who may already have access, modifying a file to plant something persistent (**Installation**). Mapping alerts to the correct Kill Chain stage, not just the correct rule, is what turns a list of alerts into a coherent incident narrative.
+
 ## Operational Notes
 
 - The Wazuh indexer (OpenSearch-based) takes 5-10 minutes to fully initialize on this CPU after every start. A shell script (`homelab.sh`) standardizes starting, stopping, and checking status of the full stack.
