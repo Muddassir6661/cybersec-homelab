@@ -4,7 +4,7 @@
 
 ## Overview
 
-This project involved building a small-scale Security Operations Center (SOC) lab on repurposed hardware to practice both offensive and defensive security skills. The goal was to deploy an intentionally vulnerable web application, monitor it with a SIEM, and write custom detection rules to catch real attacks as they happen — end to end, from exploitation to alert, including full investigation of each alert.
+This project involved building a small-scale Security Operations Center (SOC) lab on repurposed hardware to practice both offensive and defensive security skills. The goal was to deploy an intentionally vulnerable web application, monitor it with a SIEM, and write custom detection rules to catch real attacks as they happen, end to end, from exploitation to alert, including full investigation of each alert.
 
 ## Hardware
 
@@ -31,10 +31,10 @@ This is well below the officially recommended specs for the tools used (Wazuh's 
 ```
 
 **Stack components (all containerized via Docker):**
-- **Portainer** — visual Docker management
-- **DVWA (Damn Vulnerable Web Application)** — intentionally vulnerable target for offensive practice
-- **Wazuh Manager, Indexer, Dashboard** — SIEM stack for log analysis, alerting, and visualization
-- **Wazuh Agent** — installed directly on the Debian host (not inside the DVWA container) to monitor host-level activity, DVWA's Apache logs, SSH authentication logs, and a File Integrity Monitoring target directory
+- **Portainer**: visual Docker management
+- **DVWA (Damn Vulnerable Web Application)**: intentionally vulnerable target for offensive practice
+- **Wazuh Manager, Indexer, Dashboard**: SIEM stack for log analysis, alerting, and visualization
+- **Wazuh Agent**: installed directly on the Debian host (not inside the DVWA container) to monitor host-level activity, DVWA's Apache logs, SSH authentication logs, and a File Integrity Monitoring target directory
 
 ## Build Process
 
@@ -49,6 +49,7 @@ This is well below the officially recommended specs for the tools used (Wazuh's 
 9. Created a disposable test account and used Hydra to simulate an SSH brute-force attack.
 10. Wrote a correlation rule to detect brute-force patterns (not just individual failed logins).
 11. Set up File Integrity Monitoring on a copy of DVWA's web root and verified real-time change detection.
+12. Added command injection coverage for DVWA's command execution page, after working out what Apache's access log can and cannot show.
 
 ## Custom Detection Rules
 
@@ -58,15 +59,16 @@ This is well below the officially recommended specs for the tools used (Wazuh's 
 | 100011 | SQL Injection | SQL keywords (`UNION`, `SELECT`) in URL |
 | 100012 | XSS (Cross-Site Scripting) | Encoded `<script>` tags in URL |
 | 100013 | SSH Brute-Force | 5+ failed SSH logins from the same source IP within 60 seconds (correlation rule, built on top of Wazuh's default `sshd` failure rule 5760) |
+| 100014 | Command Injection (endpoint) | HTTP POST to `/vulnerabilities/exec/` (level 7, parent rules `31100,31108`) |
 
 All were tested and verified using `wazuh-logtest` where applicable, then confirmed live against real attack traffic in the dashboard.
 
 ## Attack Scenario 1: SQL Injection & XSS
 
-(See "Debugging Process" below for the full story — rules 100010/100011/100012.)
+(See "Debugging Process" below for the full story on rules 100010/100011/100012.)
 
-- SQL injection via DVWA's SQLi module (`1' OR '1'='1`) → correctly triggered rule 100010, level 10 alert.
-- Reflected XSS via a quote-free payload (`<script>alert(1)</script>`) → correctly triggered rule 100012, level 10 alert, with no overlap.
+- SQL injection via DVWA's SQLi module (`1' OR '1'='1`) triggered rule 100010, level 10 alert.
+- Reflected XSS via a quote-free payload (`<script>alert(1)</script>`) triggered rule 100012, level 10 alert, with no overlap.
 
 ## Attack Scenario 2: SSH Brute-Force (Simulated with Hydra)
 
@@ -83,35 +85,53 @@ hydra -l bruteforcetest -P passwords.txt ssh://<host> -V
 **Tuning performed:** Wrote a correlation rule (100013) using Wazuh's `frequency`/`timeframe`/`same_source_ip` mechanism to escalate 5+ failures from one IP within 60 seconds into a single level-10 brute-force alert.
 
 **Investigation of the resulting alert:**
-- `data.srcip: 192.168.0.115`, `data.dstuser: bruteforcetest` — identifies source and targeted account
-- `full_log` and `previous_output` fields show the raw, correlated sshd failure log lines, including sequential source ports — a signature of automated/scripted login attempts rather than manual human retries
+- `data.srcip: 192.168.0.115`, `data.dstuser: bruteforcetest` identify the source and the targeted account
+- `full_log` and `previous_output` fields show the raw, correlated sshd failure log lines, including sequential source ports, a signature of automated/scripted login attempts rather than manual human retries
 - **Conclusion:** Pattern consistent with automated credential-stuffing/brute-force activity. Real-world next steps would include checking for a subsequent successful login from the same source, and considering IP-based rate-limiting or MFA enforcement.
 
 ## Attack Scenario 3: File Integrity Monitoring (FIM)
 
 **Setup:** Configured Wazuh's `syscheckd` module to monitor a copy of DVWA's web root in real time (`realtime="yes"` in `ossec.conf`), rather than relying on the default 12-hour scheduled scan interval.
 
-**Attack:** Appended unauthorized content to `login.php` to simulate a file tampering / backdoor-planting scenario — a common real-world attack against web application login pages.
+**Attack:** Appended unauthorized content to `login.php` to simulate a file tampering / backdoor-planting scenario, a common real-world attack against web application login pages.
 
 **Detection:** Wazuh's default rule 550 ("Integrity checksum changed") fired within seconds, in real-time mode.
 
 **Investigation of the resulting alert:**
 - Cryptographic proof of change: MD5, SHA1, and SHA256 hashes all differ between `*_before` and `*_after` fields
-- File size change (4243 → 4323 bytes) and precise modification timestamps provided
+- File size change (4243 to 4323 bytes) and precise modification timestamps provided
 - `full_log` includes a clean, human-readable summary suitable for a ticket/report
-- Alert is automatically mapped to compliance frameworks (PCI DSS 11.5, HIPAA 164.312.c.1/c.2, NIST 800-53 SI.7, GDPR II_5.1.f) — demonstrating how FIM ties directly into real compliance requirements
+- Alert is automatically mapped to compliance frameworks (PCI DSS 11.5, HIPAA 164.312.c.1/c.2, NIST 800-53 SI.7, GDPR II_5.1.f), demonstrating how FIM ties directly into real compliance requirements
 - **Conclusion:** Unauthorized modification of a security-sensitive application file (login page) was detected in real time with full forensic detail (who, what, when, and cryptographic proof), consistent with how a real SOC would catch a webshell or credential-harvesting backdoor being planted.
+
+## Attack Scenario 4: Command Injection
+
+**Setup:** DVWA's Command Injection module (security level Low) passes user input from a ping form straight into a shell command.
+
+**Attack:** Submitted `127.0.0.1; whoami` and later `127.0.0.1; id` in the form. The page returned the normal ping output followed by `www-data` and `uid=33(www-data) gid=33(www-data) groups=33(www-data)`, confirming arbitrary commands were running on the server as the web server user.
+
+**Detection gap identified:** The form submits its input as an HTTP POST body, and Apache's access log never records POST bodies. The raw log line for the attack showed only `POST /vulnerabilities/exec/ HTTP/1.1`, with no trace of `; whoami`. Payload-matching rules like the SQLi and XSS ones (which read the URL) had nothing to match.
+
+**Tuning performed:** Wrote rule 100014 to alert on any POST to the vulnerable endpoint, at level 7 rather than 10. It flags that the vulnerable page was used, but it cannot tell a harmless `127.0.0.1` from an injected command, so the lower severity is deliberate. The rule did not fire at first: `wazuh-logtest` showed Wazuh's built-in rule 31108 ("Ignored URLs (simple queries)", level 0) swallowing the plain URL before a rule built on parent 31100 could see it. Declaring both parents (`<if_sid>31100,31108</if_sid>`) fixed it.
+
+**Investigation of the resulting alert:**
+- Alert showed `rule.id: 100014`, level 7, groups including `command_injection`
+- `data.protocol: POST`, `data.url: /vulnerabilities/exec/`, and `data.srcip` identify the request and its source
+- `full_log` is the raw Apache access line, which confirms what the log did and did not capture
+- **Conclusion:** Use of a known-vulnerable command execution endpoint was detected end to end. Detecting the injected command itself would need a different log source, such as auditd watching for `www-data` spawning shell commands like `whoami` or `id`, which is a planned next step.
 
 ## Debugging Process (Key Findings)
 
 Getting these rules working was not a straight line, and the debugging process itself is arguably the most demonstrable part of this project:
 
 - **Wrong parent rule ID:** Initial SQLi rules referenced `if_sid 31108`; using `wazuh-logtest` to trace a raw log line through decoding showed the actual matching rule was `31100`. Root cause of rules silently never firing.
+- **The same trap from the other side:** For the command injection rule, `31100` was the wrong parent. A plain URL with no special characters is matched by rule 31108 (level 0, ignored) first, so the rule needed both parents. Lesson: the right parent depends on what the URL looks like, and `wazuh-logtest` is the only reliable way to find out.
 - **URL encoding blind spot:** Rules had to match the URL-encoded form of payloads (`%27`), not literal raw text, since browsers always encode special characters in requests.
+- **POST bodies are invisible to access logs:** Apache logs the request line, not the form data, so injection in a POST body cannot be matched by content. Detection fell back to the endpoint, with a lower severity to reflect the lower confidence.
 - **Manager restarts drop the agent connection:** Each manager restart (needed to reload rule changes) briefly disconnected the agent, causing tests run during that window to silently produce no results.
 - **Rule overlap / false positive:** An XSS payload containing a quote character also matched the SQLi rule, since Wazuh's rule engine stops at the first match. A `negate` condition was attempted and didn't behave as expected; the decision was made to accept and document the overlap rather than over-engineer detection logic for a lab environment.
 - **XML syntax error:** A raw, unencoded `<script>` tag inside a rule's `<url>` field broke XML parsing silently. Fixed by using only the encoded form.
-- **Hydra against DVWA's web login failed entirely:** DVWA issues a fresh session cookie and CSRF token (`user_token`) on every page load, and the login form silently rejects submissions without a valid, current token. This made Hydra's stateless attack pattern unreliable against the web form. **Pivoted to SSH brute-forcing instead** — a more standard and reliable real-world brute-force target, and arguably a stronger demonstration since it required creating a dedicated test account and tuning a genuinely new correlation rule.
+- **Hydra against DVWA's web login failed entirely:** DVWA issues a fresh session cookie and CSRF token (`user_token`) on every page load, and the login form silently rejects submissions without a valid, current token. This made Hydra's stateless attack pattern unreliable against the web form. **Pivoted to SSH brute-forcing instead**, a more standard and reliable real-world brute-force target, and arguably a stronger demonstration since it required creating a dedicated test account and tuning a genuinely new correlation rule.
 - **Docker volume mount overwrote container files:** Attempting to mount an empty host directory directly onto DVWA's `/var/www/html` inside the running container replaced (not merged with) the container's existing files, breaking DVWA. Resolved by instead using `docker cp` to take a one-time copy of the web root onto the host for FIM monitoring, avoiding any risk to the live container.
 
 ## Kill Chain & MITRE ATT&CK Mapping
@@ -120,13 +140,14 @@ Each detection rule was mapped against the Lockheed Martin Cyber Kill Chain and 
 
 | Rule | Incident | Kill Chain Stage | MITRE ATT&CK ID |
 |---|---|---|---|
-| 100010 | SQL Injection (encoded quote) | Exploitation | T1190 – Exploit Public-Facing Application |
-| 100011 | SQL Injection (keywords) | Exploitation | T1190 – Exploit Public-Facing Application |
-| 100012 | XSS (script tag) | Exploitation | T1190 – Exploit Public-Facing Application |
-| 100013 | SSH Brute-Force | Exploitation (credential access attempt) | T1110.001 – Brute Force: Password Guessing |
-| 550 (FIM) | Unauthorized file modification | Installation (persistence/backdoor being planted) | T1505.003 – Server Software Component: Web Shell |
+| 100010 | SQL Injection (encoded quote) | Exploitation | T1190 - Exploit Public-Facing Application |
+| 100011 | SQL Injection (keywords) | Exploitation | T1190 - Exploit Public-Facing Application |
+| 100012 | XSS (script tag) | Exploitation | T1190 - Exploit Public-Facing Application |
+| 100013 | SSH Brute-Force | Exploitation (credential access attempt) | T1110.001 - Brute Force: Password Guessing |
+| 100014 | Command Injection (endpoint) | Exploitation | T1190 - Exploit Public-Facing Application |
+| 550 (FIM) | Unauthorized file modification | Installation (persistence/backdoor being planted) | T1505.003 - Server Software Component: Web Shell |
 
-Note the distinction between the two later stages: SQLi, XSS, and brute-force attempts all represent an attacker trying to gain an initial foothold (**Exploitation**), while the FIM alert represents a different stage entirely — an attacker who may already have access, modifying a file to plant something persistent (**Installation**). Mapping alerts to the correct Kill Chain stage, not just the correct rule, is what turns a list of alerts into a coherent incident narrative.
+Note the distinction between the two later stages: SQLi, XSS, command injection, and brute-force attempts all represent an attacker trying to gain an initial foothold (**Exploitation**), while the FIM alert represents a different stage entirely: an attacker who may already have access, modifying a file to plant something persistent (**Installation**). Mapping alerts to the correct Kill Chain stage, not just the correct rule, is what turns a list of alerts into a coherent incident narrative.
 
 ## Operational Notes
 
@@ -143,15 +164,17 @@ Note the distinction between the two later stages: SQLi, XSS, and brute-force at
 - Custom detection rule authoring, including both signature-based rules and stateful correlation rules (frequency/timeframe)
 - Systematic debugging using purpose-built tooling (`wazuh-logtest`) rather than trial-and-error guessing
 - Offensive tooling: THC-Hydra for credential brute-forcing
-- Understanding of common web attack patterns (SQLi, XSS) and their encoded/real-world representations
+- Understanding of common web attack patterns (SQLi, XSS, command injection) and their encoded/real-world representations
+- Reasoning about log-source limitations (POST bodies absent from access logs) and setting alert severity to match detection confidence
 - File Integrity Monitoring configuration and real-time alert investigation
-- Full alert lifecycle investigation: trigger → verification via raw log/forensic data → conclusion
+- Full alert lifecycle investigation: trigger, verification via raw log/forensic data, conclusion
 - Practical trade-off judgment (pivoting attack vectors when one proved unreliable; accepting rule overlap rather than over-engineering a lab environment)
 - Secure remote access configuration (Tailscale VPN)
 
 ## Next Steps
 
-- Expand attack coverage: command injection, privilege escalation simulation
+- Detect the command injection payload itself (not just the endpoint) using auditd to watch for the web server user spawning shell commands
+- Add privilege escalation simulation
 - Incorporate RedSim (custom network attack simulation toolkit) as an additional attack source
 - Investigate and resolve the host's IPv6 connectivity issue
 - Patch the CVE-2021-35331-affected packages identified by Wazuh's vulnerability detection module
