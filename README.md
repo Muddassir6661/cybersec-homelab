@@ -52,6 +52,7 @@ This is well below the officially recommended specs for the tools used (Wazuh's 
 12. Added command injection coverage for DVWA's command execution page, after working out what Apache's access log can and cannot show.
 13. Connected MyTRE, a custom ATT&CK-mapped adversary emulation framework, as an automated attack source, with a small HTTP receiver on the lab host whose log is also collected by the Wazuh agent.
 14. Extended File Integrity Monitoring to `~/.ssh` and `/tmp` and wrote custom rules for SSH key persistence and attacker tool drops.
+15. Wrote a correlation rule that escalates a successful SSH login that follows repeated failures from the same IP.
 
 ## Custom Detection Rules
 
@@ -66,6 +67,7 @@ This is well below the officially recommended specs for the tools used (Wazuh's 
 | 100016 | MyTRE receiver telemetry | Receiver request that returned `status=200` (level 5, child of 100015) |
 | 100017 | SSH key persistence | `authorized_keys` modified or added, via FIM (level 10, parents `550,554`) |
 | 100018 | Attacker tool transfer | New file added under `/tmp`, via FIM (level 8, parent `554`) |
+| 100019 | SSH brute force that succeeded | Successful SSH login (5715) after 5+ failures (5760) from the same IP within 120 seconds (level 12, correlation rule) |
 
 All were tested and verified using `wazuh-logtest` where applicable, then confirmed live against real attack traffic in the dashboard.
 
@@ -164,6 +166,20 @@ hydra -l bruteforcetest -P passwords.txt ssh://<host> -V
 
 **Known limitation:** The ATT&CK fields did not appear in the alert output for rule 100018, even though the rule definition contains the mapping and the technique exists in Wazuh's ATT&CK database. The cause was not found, so the mapping is recorded in this document and the rule file.
 
+## Attack Scenario 8: Brute Force That Succeeds
+
+**Detection gap identified:** Rule 100013 alerts on repeated failed logins, but a brute-force attempt only becomes an incident when a login finally succeeds. Wazuh's default rule 5715 treats that success as a routine, level 3 event with no memory of the failures before it.
+
+**Tuning performed:** Wrote correlation rule 100019, which fires on a successful SSH login (5715) when five or more failures (5760) came from the same source IP within the previous 120 seconds. It is built on the raw failure events rather than on rule 100013, which is the most reliable way to chain events in Wazuh. It is level 12 because it is the point where an attacker may actually have access.
+
+**Testing:** First validated with `wazuh-logtest` by replaying six failures and a success, which showed the full escalation: 5760 for the early failures, 100013 on the fifth, then 100019 on the login that followed. Then run live with Hydra (one connection at a time, using a separate password list with six wrong guesses before the correct one) against the disposable `bruteforcetest` account.
+
+**Investigation of the resulting alert:**
+- `data.srcip`, `data.dstuser` and the successful `full_log` line identify the source and the compromised account
+- `previous_output` holds the failed login lines that led up to the success, which is the evidence trail an analyst would follow
+- Mapped to **T1110 (Brute Force, Credential Access)**
+- **Conclusion:** A successful brute force was detected as a distinct, high-severity event. Real-world next steps would be to look at what that session did next, force a password reset for the account, and block the source IP.
+
 ## Debugging Process (Key Findings)
 
 Getting these rules working was not a straight line, and the debugging process itself is arguably the most demonstrable part of this project:
@@ -177,6 +193,8 @@ Getting these rules working was not a straight line, and the debugging process i
 - **XML syntax error:** A raw, unencoded `<script>` tag inside a rule's `<url>` field broke XML parsing silently. Fixed by using only the encoded form.
 - **Receiver telemetry rule never fired live:** Rule 100016 matched in offline testing but produced no live alerts. The original rule 100015 matched on the text `mytre_receiver`. The log timestamp format and the collector's log format were ruled out one at a time with `wazuh-logtest`, and a one-line change to match `event=http_request` instead fixed it. Why the original match failed was not fully explained, so the fix is verified but the root cause is not.
 - **Testing against the wrong address:** A test request to `localhost` failed because the receiver listens only on the host's LAN address. A failed test was the test's fault, not the pipeline's, which is why each step was checked before changing any rule.
+- **Test inputs must match the rule's thresholds:** The existing password list put the correct password fifth, so only four failures would precede the success, below the rule's threshold of five. A separate list with six wrong guesses, and Hydra limited to one task at a time, made the attack reproducible.
+- **Tool warnings can mislead:** `wazuh-logtest` printed warnings that ATT&CK technique IDs were not found in its database, even for Wazuh's built-in rules, yet the live alert for rule 100019 carried the full T1110 mapping. Logtest results were treated as proof of the rule logic, not of the final alert contents.
 - **Safe-change routine:** Every rule or config edit was preceded by a timestamped backup, followed by one change, validation with `wazuh-analysisd -t` (exit code 0), a restart, and a live attack to confirm the alert.
 - **Generic alerts, specific rules:** Default FIM rules 550 and 554 fire for any file, with generic ATT&CK tags. Child rules scoped to specific paths (`authorized_keys`, `/tmp`) turn them into alerts that name the attacker behavior.
 - **Hydra against DVWA's web login failed entirely:** DVWA issues a fresh session cookie and CSRF token (`user_token`) on every page load, and the login form silently rejects submissions without a valid, current token. This made Hydra's stateless attack pattern unreliable against the web form. **Pivoted to SSH brute-forcing instead**, a more standard and reliable real-world brute-force target, and arguably a stronger demonstration since it required creating a dedicated test account and tuning a genuinely new correlation rule.
@@ -195,6 +213,7 @@ Each detection rule was mapped against the Lockheed Martin Cyber Kill Chain and 
 | 100014 | Command Injection (endpoint) | Exploitation | T1190 - Exploit Public-Facing Application |
 | 100017 | SSH key persistence (authorized_keys changed) | Installation (persistence) | T1098.004 - Account Manipulation: SSH Authorized Keys |
 | 100018 | Tool dropped in `/tmp` | Installation / Command and Control (tool staging) | T1105 - Ingress Tool Transfer |
+| 100019 | SSH brute force followed by successful login | Exploitation (credential access succeeded) | T1110 - Brute Force |
 | 550 (FIM) | Unauthorized file modification | Installation (persistence/backdoor being planted) | T1505.003 - Server Software Component: Web Shell |
 
 Rules 100015 and 100016 are lab telemetry for the MyTRE receiver, not attack detections, so they are not mapped. Note the distinction between the later stages: SQLi, XSS, command injection, and brute-force attempts all represent an attacker trying to gain an initial foothold (**Exploitation**), while the FIM alerts (web root tampering, SSH key changes, tools dropped in `/tmp`) represent a different stage entirely: an attacker who may already have access, planting something persistent or staging tools (**Installation**). Mapping alerts to the correct Kill Chain stage, not just the correct rule, is what turns a list of alerts into a coherent incident narrative.
@@ -218,6 +237,7 @@ Rules 100015 and 100016 are lab telemetry for the MyTRE receiver, not attack det
 - Offensive tooling: THC-Hydra for credential brute-forcing
 - Understanding of common web attack patterns (SQLi, XSS, command injection) and their encoded/real-world representations
 - Red/blue loop: running an automated adversary emulation framework (MyTRE) and verifying which of its stages the SIEM catches
+- Building multi-event correlation rules that separate a failed attack from a successful one
 - Writing child rules that sharpen default FIM alerts into specific, ATT&CK-mapped detections (SSH key persistence, tool staging)
 - Reasoning about log-source limitations (POST bodies absent from access logs) and setting alert severity to match detection confidence
 - File Integrity Monitoring configuration and real-time alert investigation
@@ -228,7 +248,7 @@ Rules 100015 and 100016 are lab telemetry for the MyTRE receiver, not attack det
 ## Next Steps
 
 - Detect the command injection payload itself (not just the endpoint) using auditd to watch for the web server user spawning shell commands
-- Add a correlation rule for SSH brute force followed by a successful login (repeated 5716 failures, then 5715)
+- Set up email alerts for high-severity rules such as 100019 (needs an SMTP relay, with credentials kept out of the repository)
 - Find out why the ATT&CK fields are missing from rule 100018 alerts
 - Add privilege escalation simulation
 - Investigate and resolve the host's IPv6 connectivity issue
