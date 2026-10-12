@@ -1,6 +1,7 @@
 # Home SOC Lab: Building a Detection Pipeline with Wazuh and DVWA
 
-<img width="1919" height="970" alt="Screenshot 2026-09-07 111845" src="https://github.com/user-attachments/assets/7cd70b13-185f-4fcd-8442-a735cc7520d9" />
+<img width="1919" height="1042" alt="image" src="https://github.com/user-attachments/assets/42d17852-e3a0-4820-8796-36af8c470125" />
+
 
 ## Overview
 
