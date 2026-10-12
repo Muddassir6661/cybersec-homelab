@@ -2,7 +2,6 @@
 
 <img width="1919" height="1042" alt="image" src="https://github.com/user-attachments/assets/42d17852-e3a0-4820-8796-36af8c470125" />
 
-
 ## Overview
 
 This project involved building a small-scale Security Operations Center (SOC) lab on repurposed hardware to practice both offensive and defensive security skills. The goal was to deploy an intentionally vulnerable web application, monitor it with a SIEM, and write custom detection rules to catch real attacks as they happen, end to end, from exploitation to alert, including full investigation of each alert.
@@ -37,6 +36,8 @@ This is well below the officially recommended specs for the tools used (Wazuh's 
 - **Wazuh Manager, Indexer, Dashboard**: SIEM stack for log analysis, alerting, and visualization
 - **Wazuh Agent**: installed directly on the Debian host (not inside the DVWA container) to monitor host-level activity, DVWA's Apache logs, SSH authentication logs, and a File Integrity Monitoring target directory
 
+**Alerting path:** Wazuh Manager --> SMTP relay container (Postfix, same Docker network) --> Gmail --> email inbox. The relay holds the mail credentials, so the manager only ever hands it alerts over an internal connection.
+
 ## Build Process
 
 1. Wiped a prior OpenMediaVault installation and performed a clean Debian install.
@@ -54,8 +55,7 @@ This is well below the officially recommended specs for the tools used (Wazuh's 
 13. Connected MyTRE, a custom ATT&CK-mapped adversary emulation framework, as an automated attack source, with a small HTTP receiver on the lab host whose log is also collected by the Wazuh agent.
 14. Extended File Integrity Monitoring to `~/.ssh` and `/tmp` and wrote custom rules for SSH key persistence and attacker tool drops.
 15. Wrote a correlation rule that escalates a successful SSH login that follows repeated failures from the same IP.
-16. Configured the manager's email notification settings to use a local Docker SMTP relay; the relay was manually tested, but end-to-end Wazuh alert delivery still needs confirmation.
-17. Began investigating recurring FIM alerts for short-lived `/tmp/runc-process*` files. These events match Wazuh rules 554 (file added) and 553 (file deleted); their source is not yet conclusively verified.
+16. Set up email alerting for high-severity detections through a small SMTP relay container, using a dedicated Gmail account with an app password.
 
 ## Custom Detection Rules
 
@@ -183,24 +183,20 @@ hydra -l bruteforcetest -P passwords.txt ssh://<host> -V
 - Mapped to **T1110 (Brute Force, Credential Access)**
 - **Conclusion:** A successful brute force was detected as a distinct, high-severity event. Real-world next steps would be to look at what that session did next, force a password reset for the account, and block the source IP.
 
-## Current Investigation: Repeated `/tmp/runc-process*` Alerts
+## Email Alerting
 
-**Observed behavior:** The host agent's real-time FIM configuration monitors `/tmp` with `check_all="yes"`. The manager repeatedly receives add/delete events for root-owned, short-lived files named `/tmp/runc-process<digits>`. The events are decoded as `syscheck_new_entry` and `syscheck_deleted`, producing built-in rules 554 (level 5) and 553 (level 7).
+**Goal:** Get an email when a high-severity alert fires, so a successful brute force (rule 100019, level 12) does not depend on someone watching the dashboard.
 
-**What has been checked:**
-- The active host configuration contains `<directories realtime="yes" check_all="yes">/tmp</directories>`.
-- An FIM exclusion was added for `^/tmp/runc-process[^/]*$`. The agent log confirmed that the exclusion was loaded, but the manager continued to receive alerts.
-- The built-in definitions in `0015-ossec_rules.xml` show that rule 554 matches decoder `syscheck_new_entry`, while rule 553 matches `syscheck_deleted`; neither built-in rule has a path condition.
-- A `wazuh-logtest` attempt using a copied JSON alert was decoded as generic JSON. Testing the plain `full_log` line did not match a decoder. These attempts did not establish whether the custom suppression rules match correctly.
+**Design:** Wazuh's built-in mailer cannot log in to Gmail on its own, so a small Postfix relay container (`boky/postfix`) joins the manager's Docker network, holds the Gmail credentials, and forwards mail on its behalf. The manager is pointed at the relay by container name. A dedicated sender account is used instead of a personal inbox, because an app password gives full access to the account it belongs to and this host is deliberately attacked.
 
-**Status:** Unresolved. The naming pattern suggests runtime-generated temporary files, but that is a hypothesis, not a confirmed attribution. Do not describe these events as malicious or benign until their source is verified. The attempted suppression approach did not work; the temporary rules were removed.
+**Credential handling:** The app password is entered at a hidden prompt and written to a file readable only by the owner (`chmod 600`) on the lab host. It is never typed into a terminal in clear text, never committed to this repository, and never appears in logs (the relay redacts it).
 
-**Investigation plan:**
-1. Confirm the current persistent `local_rules.xml` and remove only unsuccessful rules 100020/100021, retaining a backup.
-2. Validate the manager configuration and confirm it loaded the intended rules file.
-3. Review Wazuh 4.9.2 FIM exclusion behavior for real-time monitoring using version-matched documentation or source.
-4. Correlate file creation with host process/runtime activity to identify the creator.
-5. Apply one evidence-based change, then verify that these alerts stop and unrelated `/tmp` FIM alerts still work.
+**Configuration:**
+- `email_notification` enabled in the manager's `<global>` block, with the relay as `smtp_server` and a single recipient
+- Alert threshold of level 12 (`email_alert_level`), so only the most serious alerts send mail
+- `email_maxperhour` left at 12 so a noisy attack cannot flood an inbox
+
+**Testing:** Validated the config with `wazuh-analysisd -t`, checked the manager could reach the relay on port 25, then replayed the Hydra brute-force attack. The level 12 alert for rule 100019 arrived in the inbox.
 
 ## Debugging Process (Key Findings)
 
@@ -217,11 +213,18 @@ Getting these rules working was not a straight line, and the debugging process i
 - **Testing against the wrong address:** A test request to `localhost` failed because the receiver listens only on the host's LAN address. A failed test was the test's fault, not the pipeline's, which is why each step was checked before changing any rule.
 - **Test inputs must match the rule's thresholds:** The existing password list put the correct password fifth, so only four failures would precede the success, below the rule's threshold of five. A separate list with six wrong guesses, and Hydra limited to one task at a time, made the attack reproducible.
 - **Tool warnings can mislead:** `wazuh-logtest` printed warnings that ATT&CK technique IDs were not found in its database, even for Wazuh's built-in rules, yet the live alert for rule 100019 carried the full T1110 mapping. Logtest results were treated as proof of the rule logic, not of the final alert contents.
+- **Config validation caught a misplaced setting:** `email_alert_level` was first added to the `<global>` block, where Wazuh rejects it. Running `wazuh-analysisd -t` before restarting reported the invalid element, so nothing was broken. The setting belongs in the alerts configuration, and the fix was to remove it and confirm the default threshold.
+- **Verify after redoing a change:** After redoing the email settings, a read-only check of every change showed the recipient list had drifted from the original plan (two addresses planned, one configured). The check caught it, and a single recipient was kept on purpose. Verifying the end state, instead of trusting that each edit stuck, is now part of the routine.
+- **Recurring false positives from `docker exec`:** After `/tmp` was added to FIM, the dashboard filled with add/delete alert pairs (rules 554 and 553, plus custom rule 100018) for short-lived files named `/tmp/runc-process*`. Searching for the files and the creating process failed, because the files live for roughly 100 milliseconds and are root-owned with mode 0600.
+- **Hypothesis tested before acting:** Container exec activity was suspected as the source. A timed test confirmed it: a manual `docker exec` produced an add/delete pair within one second, about 100 ms apart. Other pairs appeared on a roughly 30-second timer, which fits container healthchecks, though that part was not proven.
+- **Why earlier fixes failed:** Two regex-style ignore patterns and two level-0 suppression rules never matched, because Wazuh's `sregex` and rule field matching use their own limited pattern language and do not support constructs like `.*` or `[^/]`.
+- **A fix that silently broke a real detection:** One attempted fix rewrote rule 100018 with a lookahead pattern, which can never match in that pattern language. The rule stopped firing and nothing reported an error. It was only caught because real detections were re-tested after the change, which is why every fix is now followed by a test that the intended alert still fires.
+- **Final fix:** A prefix-only agent-side ignore (`^/tmp/runc-process`), the broken rule 100018 pattern restored to `^/tmp/`, and the dead suppression rules removed. Verified in both directions: a normal file in `/tmp` fires rule 100018 again, and `docker exec` creates no new alerts.
+- **Accepted trade-off:** Any file an attacker names `runc-process...` would also be ignored. For a lab this is acceptable and documented. A production setup would scope the ignore more tightly or identify the creating process with auditd.
 - **Safe-change routine:** Every rule or config edit was preceded by a timestamped backup, followed by one change, validation with `wazuh-analysisd -t` (exit code 0), a restart, and a live attack to confirm the alert.
 - **Generic alerts, specific rules:** Default FIM rules 550 and 554 fire for any file, with generic ATT&CK tags. Child rules scoped to specific paths (`authorized_keys`, `/tmp`) turn them into alerts that name the attacker behavior.
 - **Hydra against DVWA's web login failed entirely:** DVWA issues a fresh session cookie and CSRF token (`user_token`) on every page load, and the login form silently rejects submissions without a valid, current token. This made Hydra's stateless attack pattern unreliable against the web form. **Pivoted to SSH brute-forcing instead**, a more standard and reliable real-world brute-force target, and arguably a stronger demonstration since it required creating a dedicated test account and tuning a genuinely new correlation rule.
 - **Docker volume mount overwrote container files:** Attempting to mount an empty host directory directly onto DVWA's `/var/www/html` inside the running container replaced (not merged with) the container's existing files, breaking DVWA. Resolved by instead using `docker cp` to take a one-time copy of the web root onto the host for FIM monitoring, avoiding any risk to the live container.
-- **Unresolved `/tmp/runc-process*` FIM noise:** Real-time monitoring of `/tmp` repeatedly reports short-lived `runc-process` files through rules 554 and 553. The configured `<ignore type="sregex">` entry was logged as loaded by the agent, yet alerts continued. A subsequent suppression-rule attempt also failed and was removed. Root cause has not been established; see the investigation section above.
 
 ## Kill Chain & MITRE ATT&CK Mapping
 
@@ -246,8 +249,8 @@ Rules 100015 and 100016 are lab telemetry for the MyTRE receiver, not attack det
 - The Wazuh indexer (OpenSearch-based) takes 5-10 minutes to fully initialize on this CPU after every start. A shell script (`homelab.sh`) standardizes starting, stopping, and checking status of the full stack.
 - Given RAM constraints, the stack is run on-demand rather than kept online continuously.
 - The agent monitors in real time: the DVWA web root copy, `~/.ssh` and `/tmp`, plus scheduled scans of `/etc`, `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin` and `/boot`.
-- Custom rules live in the manager's `local_rules.xml` (inside a Docker volume). Each edit should follow a backup, validation, restart, and live verification routine.
-- Email notification settings point to a local Docker SMTP relay; a manual relay test succeeded, but Wazuh-generated alert delivery has not yet been confirmed end to end.
+- The agent ignores paths starting with `/tmp/runc-process` (container runtime temp files) to keep FIM noise down; everything else in `/tmp` is still monitored.
+- Custom rules live in the manager's `local_rules.xml` (inside a Docker volume). Each edit follows a backup, validate, restart, test routine.
 - Remote access to the lab (dashboard, SSH) is provided via Tailscale (WireGuard-based mesh VPN), avoiding any direct exposure of DVWA or Wazuh to the public internet.
 
 ## Skills Demonstrated
@@ -261,6 +264,8 @@ Rules 100015 and 100016 are lab telemetry for the MyTRE receiver, not attack det
 - Offensive tooling: THC-Hydra for credential brute-forcing
 - Understanding of common web attack patterns (SQLi, XSS, command injection) and their encoded/real-world representations
 - Red/blue loop: running an automated adversary emulation framework (MyTRE) and verifying which of its stages the SIEM catches
+- Building an alerting pipeline (SMTP relay container, secret handling, alert thresholds) and verifying it end to end
+- Systematic false-positive tuning: forming a hypothesis, testing it with a timed experiment, fixing narrowly, and re-testing that real detections still work
 - Building multi-event correlation rules that separate a failed attack from a successful one
 - Writing child rules that sharpen default FIM alerts into specific, ATT&CK-mapped detections (SSH key persistence, tool staging)
 - Reasoning about log-source limitations (POST bodies absent from access logs) and setting alert severity to match detection confidence
@@ -272,9 +277,8 @@ Rules 100015 and 100016 are lab telemetry for the MyTRE receiver, not attack det
 ## Next Steps
 
 - Detect the command injection payload itself (not just the endpoint) using auditd to watch for the web server user spawning shell commands
-- Verify end-to-end Wazuh email alert delivery for high-severity rules such as 100019 through the configured SMTP relay; keep SMTP credentials out of the repository
+- Review which alert levels should send email now that the pipeline works, and consider a daily summary of lower-level alerts
 - Find out why the ATT&CK fields are missing from rule 100018 alerts
-- Resolve the repeated `/tmp/runc-process*` FIM alerts using a version-verified investigation
 - Add privilege escalation simulation
 - Investigate and resolve the host's IPv6 connectivity issue
 - Patch the CVE-2021-35331-affected packages identified by Wazuh's vulnerability detection module
