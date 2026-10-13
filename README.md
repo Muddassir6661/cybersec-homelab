@@ -4,7 +4,7 @@
 
 ## Overview
 
-This project involved building a small-scale Security Operations Center (SOC) lab on repurposed hardware to practice both offensive and defensive security skills. The goal was to deploy an intentionally vulnerable web application, monitor it with a SIEM, and write custom detection rules to catch real attacks as they happen, end to end, from exploitation to alert, including full investigation of each alert.
+This project involved building a small-scale Security Operations Center (SOC) lab on repurposed hardware to practice both offensive and defensive security skills. The goal was to deploy an intentionally vulnerable web application, monitor it with a SIEM, and write custom detection rules to catch real attacks as they happen, end-to-end, from exploitation to alert, including full investigation of each alert.
 
 ## Hardware
 
@@ -56,6 +56,7 @@ This is well below the officially recommended specs for the tools used (Wazuh's 
 14. Extended File Integrity Monitoring to `~/.ssh` and `/tmp` and wrote custom rules for SSH key persistence and attacker tool drops.
 15. Wrote a correlation rule that escalates a successful SSH login that follows repeated failures from the same IP.
 16. Set up email alerting for high-severity detections through a small SMTP relay container, using a dedicated Gmail account with an app password.
+17. Built a read-only alerts API on the host so an external tool (MyTRE) can check which attack stages were detected, using a dedicated read-only indexer user.
 
 ## Custom Detection Rules
 
@@ -198,6 +199,29 @@ hydra -l bruteforcetest -P passwords.txt ssh://<host> -V
 
 **Testing:** Validated the config with `wazuh-analysisd -t`, checked the manager could reach the relay on port 25, then replayed the Hydra brute-force attack. The level 12 alert for rule 100019 arrived in the inbox.
 
+## Alerts API (Read-Only Alert Access for MyTRE)
+
+**Goal:** Let MyTRE check which of its attack stages Wazuh actually detected, without handing it dashboard or admin access.
+
+**Design:**
+- A small FastAPI service runs on the lab host as a systemd service, so it starts on boot and restarts if it crashes
+- It listens only on the host's Tailscale address, not on the home network. Traffic is plain HTTP, but it only travels over Tailscale, which encrypts it end to end
+- It reads alerts from the Wazuh indexer. The Wazuh manager API (port 55000) was confirmed working, but it manages agents and rules and does not serve alerts
+- `GET /health` needs no key. `GET /alerts` requires a bearer API key (compared in constant time) and supports filters for age, minimum level, rule ID and result limit. Interactive API docs are disabled
+
+**Least privilege:** The service does not use the indexer's `admin` login. A dedicated user with a custom role can only read `wazuh-alerts-*`. This was verified in both directions: the user can read alerts, and requests for cluster health and the security index return `403`.
+
+**Credential handling:**
+- The read-only password and the API key are generated randomly on the host
+- They are stored only in files readable by one user (`chmod 600`), never printed in the terminal, and never committed to this repository
+- Setup commands print masked output so the result can be checked without exposing a secret
+
+**Verification:** Tested locally (no key returns `401`, a valid key returns alerts), then from a separate Windows machine over Tailscale, which is where MyTRE runs.
+
+**Security findings from the setup:**
+- A check of the indexer's built-in accounts showed they still use published default passwords, and port 9200 is published on all host interfaces, so the home network can reach it. Access from outside is limited to a private Tailscale network, so this was accepted for now and added to Next Steps
+- The same check taught a lesson about reading results: an HTTP `403` means the login worked but was not authorized, so it counts as a successful login, not a rejection
+
 ## Debugging Process (Key Findings)
 
 Getting these rules working was not a straight line, and the debugging process itself is arguably the most demonstrable part of this project:
@@ -221,6 +245,7 @@ Getting these rules working was not a straight line, and the debugging process i
 - **A fix that silently broke a real detection:** One attempted fix rewrote rule 100018 with a lookahead pattern, which can never match in that pattern language. The rule stopped firing and nothing reported an error. It was only caught because real detections were re-tested after the change, which is why every fix is now followed by a test that the intended alert still fires.
 - **Final fix:** A prefix-only agent-side ignore (`^/tmp/runc-process`), the broken rule 100018 pattern restored to `^/tmp/`, and the dead suppression rules removed. Verified in both directions: a normal file in `/tmp` fires rule 100018 again, and `docker exec` creates no new alerts.
 - **Accepted trade-off:** Any file an attacker names `runc-process...` would also be ignored. For a lab this is acceptable and documented. A production setup would scope the ignore more tightly or identify the creating process with auditd.
+- **Reading status codes correctly:** A default-credential check assumed `401` meant rejected and `200` meant accepted. Several accounts returned `403`, which means the login succeeded but the account was not authorized for that page. The check was re-read and the conclusion corrected before acting on it.
 - **Safe-change routine:** Every rule or config edit was preceded by a timestamped backup, followed by one change, validation with `wazuh-analysisd -t` (exit code 0), a restart, and a live attack to confirm the alert.
 - **Generic alerts, specific rules:** Default FIM rules 550 and 554 fire for any file, with generic ATT&CK tags. Child rules scoped to specific paths (`authorized_keys`, `/tmp`) turn them into alerts that name the attacker behavior.
 - **Hydra against DVWA's web login failed entirely:** DVWA issues a fresh session cookie and CSRF token (`user_token`) on every page load, and the login form silently rejects submissions without a valid, current token. This made Hydra's stateless attack pattern unreliable against the web form. **Pivoted to SSH brute-forcing instead**, a more standard and reliable real-world brute-force target, and arguably a stronger demonstration since it required creating a dedicated test account and tuning a genuinely new correlation rule.
@@ -251,6 +276,7 @@ Rules 100015 and 100016 are lab telemetry for the MyTRE receiver, not attack det
 - The agent monitors in real time: the DVWA web root copy, `~/.ssh` and `/tmp`, plus scheduled scans of `/etc`, `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin` and `/boot`.
 - The agent ignores paths starting with `/tmp/runc-process` (container runtime temp files) to keep FIM noise down; everything else in `/tmp` is still monitored.
 - Custom rules live in the manager's `local_rules.xml` (inside a Docker volume). Each edit follows a backup, validate, restart, test routine.
+- The alerts API binds to the host's Tailscale address, so it is reachable only while Tailscale is running. Its key and the read-only indexer login live in `chmod 600` files on the host.
 - Remote access to the lab (dashboard, SSH) is provided via Tailscale (WireGuard-based mesh VPN), avoiding any direct exposure of DVWA or Wazuh to the public internet.
 
 ## Skills Demonstrated
@@ -273,9 +299,11 @@ Rules 100015 and 100016 are lab telemetry for the MyTRE receiver, not attack det
 - Full alert lifecycle investigation: trigger, verification via raw log/forensic data, conclusion
 - Practical trade-off judgment (pivoting attack vectors when one proved unreliable; accepting rule overlap rather than over-engineering a lab environment)
 - Secure remote access configuration (Tailscale VPN)
+- Building a least-privilege service: a read-only indexer role, a dedicated user, an API key, and a Tailscale-only listener, with each permission verified by testing what is denied
 
 ## Next Steps
 
+- Rotate the indexer's default passwords (the dashboard and log shipper use them, so they must be changed together) and restrict port 9200 to localhost
 - Detect the command injection payload itself (not just the endpoint) using auditd to watch for the web server user spawning shell commands
 - Review which alert levels should send email now that the pipeline works, and consider a daily summary of lower-level alerts
 - Find out why the ATT&CK fields are missing from rule 100018 alerts
